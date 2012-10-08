@@ -141,7 +141,6 @@ func (auth *gserviceauth) Token() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// var data map[string]interface{}
 	var data authResp
 	err = json.Unmarshal(body, &data)
 	if err != nil {
