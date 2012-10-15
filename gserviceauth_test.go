@@ -14,13 +14,17 @@ var (
 )
 
 func TestGetToken(t *testing.T) {
-	scope := []string{"https://www.googleapis.com/auth/taskqueue"}
-	auth, err := New(*serviceEmail, scope, *keyPath)
+  key, err := ReadKey(*keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = auth.Token()
+	scope := []string{"https://www.googleapis.com/auth/taskqueue"}
+	auth, err := New(*serviceEmail, scope, key)
 	if err != nil {
+	  t.Fatal(err)
+  }
+  token := auth.Token()
+	if token == "" {
 		t.Fatal(err)
 	}
 }

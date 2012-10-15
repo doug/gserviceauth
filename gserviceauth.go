@@ -4,6 +4,7 @@
 /*
   For now it can't read p12 files so strip them to just the rsa key with openssl
 	openssl pkcs12 -in file.p12 -nocerts -out key.pem -nodes
+	then delete the extra text
 */
 
 package gserviceauth
@@ -23,13 +24,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
-	"fmt"
 )
 
 const (
 	aud       = "https://accounts.google.com/o/oauth2/token"
-	grantType = "urn:ietf:params:oauth:grant-type:gserviceauth-bearer"
+	grantType = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 )
 
 var (
@@ -39,11 +40,13 @@ var (
 type gserviceauth struct {
 	Email string
 	Scope []string
-	key   *rsa.PrivateKey
-	token []byte
+	Key   *rsa.PrivateKey
+	token string
+	stop  chan bool
+	m     *sync.Mutex
 }
 
-func readKey(keyFile string) (*rsa.PrivateKey, error) {
+func ReadKey(keyFile string) (*rsa.PrivateKey, error) {
 	keyPEMBlock, err := ioutil.ReadFile(keyFile)
 	if err != nil {
 		return nil, err
@@ -71,22 +74,26 @@ func b64urlencode(b []byte) []byte {
 	return encoded
 }
 
-func New(email string, scope []string, keyPath string) (*gserviceauth, error) {
+func New(email string, scope []string, key *rsa.PrivateKey) (*gserviceauth, error) {
 	auth := new(gserviceauth)
 	auth.Email = email
 	auth.Scope = scope
-	k, err := readKey(keyPath)
-	if err != nil {
-		return nil, err
-	}
-	auth.key = k
+	auth.Key = key
+  token, err := auth.fetchToken()
+  if err != nil {
+    return nil, err
+  }
+  auth.token = token
+  auth.stop = make(chan bool)
+  auth.m = new(sync.Mutex)
+	go auth.autoRefresh()
 	return auth, nil
 }
 
 func (auth *gserviceauth) assertion() ([]byte, error) {
 	header, err := json.Marshal(
 		map[string]interface{}{
-			"typ": "gserviceauth",
+			"typ": "JWT",
 			"alg": "RS256",
 		})
 	if err != nil {
@@ -110,7 +117,7 @@ func (auth *gserviceauth) assertion() ([]byte, error) {
 
 	sha := sha256.New()
 	sha.Write(bytes.Join(parts[:2], separator))
-	signature, err := rsa.SignPKCS1v15(rand.Reader, auth.key, crypto.SHA256, sha.Sum(nil))
+	signature, err := rsa.SignPKCS1v15(rand.Reader, auth.Key, crypto.SHA256, sha.Sum(nil))
 	if err != nil {
 		return nil, err
 	}
@@ -125,29 +132,60 @@ type authResp struct {
 	Error       string `json:"error,omitempty"`
 }
 
-func (auth *gserviceauth) Token() ([]byte, error) {
+func (auth *gserviceauth) fetchToken() (string, error) {
 	assertion, err := auth.assertion()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	values := url.Values{"grant_type": {grantType}, "assertion": {string(assertion)}}
-	fmt.Println(values.Encode())
 	resp, err := http.PostForm(aud, values)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	var data authResp
 	err = json.Unmarshal(body, &data)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if len(data.Error) != 0 {
-		return nil, errors.New(data.Error)
+		return "", errors.New(data.Error)
 	}
-	return []byte(data.AccessToken), nil
+	return data.AccessToken, nil
 }
+
+func (auth *gserviceauth) autoRefresh() {
+  for {
+    select {
+    case <-time.After(time.Minute * 55):
+      token, err := auth.fetchToken()
+      if err != nil {
+        panic(err)
+      }
+      auth.m.Lock()
+      auth.token = token
+      auth.m.Unlock()
+      break
+    case <-auth.stop:
+      return
+    }
+  }
+}
+
+// Sends the stop command to no longer autoRefresh the token
+func (auth *gserviceauth) Stop() {
+  auth.stop <- true
+}
+
+// Gets the current token for use, this will autoRefresh so it is valid
+func (auth *gserviceauth) Token() string {
+  auth.m.Lock()
+  token := auth.token
+  auth.m.Unlock()
+  return token
+}
+
