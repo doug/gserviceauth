@@ -20,11 +20,11 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -37,13 +37,12 @@ var (
 	separator = []byte{'.'}
 )
 
-type gserviceauth struct {
-	Email string
-	Scope []string
-	Key   *rsa.PrivateKey
-	token string
-	stop  chan bool
-	m     *sync.Mutex
+type Auth struct {
+	Email   string
+	Scope   []string
+	Key     *rsa.PrivateKey
+	token   string
+	refresh chan bool
 }
 
 func ReadKey(keyFile string) (*rsa.PrivateKey, error) {
@@ -74,23 +73,22 @@ func b64urlencode(b []byte) []byte {
 	return encoded
 }
 
-func New(email string, scope []string, key *rsa.PrivateKey) (*gserviceauth, error) {
-	auth := new(gserviceauth)
+func New(email string, scope []string, key *rsa.PrivateKey) (*Auth, error) {
+	auth := new(Auth)
 	auth.Email = email
 	auth.Scope = scope
 	auth.Key = key
-  token, err := auth.fetchToken()
-  if err != nil {
-    return nil, err
-  }
-  auth.token = token
-  auth.stop = make(chan bool)
-  auth.m = new(sync.Mutex)
+	token, err := auth.fetchToken()
+	if err != nil {
+		return nil, err
+	}
+	auth.token = token
+	auth.refresh = make(chan bool)
 	go auth.autoRefresh()
 	return auth, nil
 }
 
-func (auth *gserviceauth) assertion() ([]byte, error) {
+func (auth *Auth) assertion() ([]byte, error) {
 	header, err := json.Marshal(
 		map[string]interface{}{
 			"typ": "JWT",
@@ -132,7 +130,7 @@ type authResp struct {
 	Error       string `json:"error,omitempty"`
 }
 
-func (auth *gserviceauth) fetchToken() (string, error) {
+func (auth *Auth) fetchToken() (string, error) {
 	assertion, err := auth.assertion()
 	if err != nil {
 		return "", err
@@ -158,34 +156,34 @@ func (auth *gserviceauth) fetchToken() (string, error) {
 	return data.AccessToken, nil
 }
 
-func (auth *gserviceauth) autoRefresh() {
-  for {
-    select {
-    case <-time.After(time.Minute * 55):
-      token, err := auth.fetchToken()
-      if err != nil {
-        panic(err)
-      }
-      auth.m.Lock()
-      auth.token = token
-      auth.m.Unlock()
-      break
-    case <-auth.stop:
-      return
-    }
-  }
+const REFRESH_RATE = time.Minute * 50
+
+func (auth *Auth) autoRefresh() {
+	var retry = REFRESH_RATE
+	for {
+		select {
+		case <-time.After(retry):
+			fmt.Printf("Refreshing token\n")
+			token, err := auth.fetchToken()
+			if err != nil {
+				retry = time.Second * 30
+				fmt.Printf("Refresh token failed: %v\nTrying again in %v\n", err, retry)
+			} else {
+				retry = REFRESH_RATE
+				fmt.Printf("Refresh token success: %v\n", token)
+				auth.token = token
+			}
+		case <-auth.refresh:
+			retry = time.Second
+		}
+	}
 }
 
-// Sends the stop command to no longer autoRefresh the token
-func (auth *gserviceauth) Stop() {
-  auth.stop <- true
+func (auth *Auth) Refresh() {
+	auth.refresh <- true
 }
 
 // Gets the current token for use, this will autoRefresh so it is valid
-func (auth *gserviceauth) Token() string {
-  auth.m.Lock()
-  token := auth.token
-  auth.m.Unlock()
-  return token
+func (auth *Auth) Token() string {
+	return auth.token
 }
-
